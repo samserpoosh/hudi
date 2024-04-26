@@ -33,6 +33,7 @@ import org.apache.hudi.sync.common.HoodieSyncConfig;
 import org.apache.hudi.utilities.IdentitySplitter;
 import org.apache.hudi.utilities.UtilHelpers;
 import org.apache.hudi.utilities.config.HoodieStreamerConfig;
+import org.apache.hudi.utilities.ingestion.HoodieIngestionException;
 import org.apache.hudi.utilities.schema.SchemaRegistryProvider;
 import org.apache.hudi.utilities.sources.JsonDFSSource;
 
@@ -53,6 +54,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
 
 import static org.apache.hudi.common.util.ConfigUtils.getStringWithAltKeys;
 import static org.apache.hudi.utilities.config.HoodieSchemaProviderConfig.SCHEMA_REGISTRY_BASE_URL;
@@ -76,8 +80,10 @@ public class HoodieMultiTableStreamer {
   private transient JavaSparkContext jssc;
   private Set<String> successTables;
   private Set<String> failedTables;
+  private final Config config;
 
   public HoodieMultiTableStreamer(Config config, JavaSparkContext jssc) throws IOException {
+    this.config = config;
     this.tableExecutionContexts = new ArrayList<>();
     this.successTables = new HashSet<>();
     this.failedTables = new HashSet<>();
@@ -239,7 +245,7 @@ public class HoodieMultiTableStreamer {
       tableConfig.operation = globalConfig.operation;
       tableConfig.sourceLimit = globalConfig.sourceLimit;
       tableConfig.checkpoint = globalConfig.checkpoint;
-      tableConfig.continuousMode = globalConfig.continuousMode;
+      tableConfig.continuousMode = false; // If continuous, we orchestrate in this class
       tableConfig.filterDupes = globalConfig.filterDupes;
       tableConfig.payloadClassName = globalConfig.payloadClassName;
       tableConfig.forceDisableCompaction = globalConfig.forceDisableCompaction;
@@ -258,7 +264,7 @@ public class HoodieMultiTableStreamer {
     }
   }
 
-  public static void main(String[] args) throws IOException {
+  public static void main(String[] args) throws InterruptedException, IOException {
     final Config config = new Config();
 
     JCommander cmd = new JCommander(config, null, args);
@@ -276,7 +282,12 @@ public class HoodieMultiTableStreamer {
           + " please use %s to configure multiple target tables", HoodieStreamerConfig.TABLES_TO_BE_INGESTED.key()));
     }
 
-    JavaSparkContext jssc = UtilHelpers.buildSparkContext("multi-table-streamer", Constants.LOCAL_SPARK_MASTER);
+    JavaSparkContext jssc = null;
+    if (StringUtils.isNullOrEmpty(config.sparkMaster)) {
+      jssc = UtilHelpers.buildSparkContext("multi_streamer", Constants.LOCAL_SPARK_MASTER);
+    } else {
+      jssc = UtilHelpers.buildSparkContext("multi_streamer", config.sparkMaster);
+    }
     try {
       new HoodieMultiTableStreamer(config, jssc).sync();
     } finally {
@@ -429,6 +440,10 @@ public class HoodieMultiTableStreamer {
 
     @Parameter(names = {"--help", "-h"}, help = true)
     public Boolean help = false;
+
+    @Parameter(names = {"--num-concurrent-streamers"},
+            description = "the min sync interval of each multi-sync in continuous mode")
+    public Integer numConcurrentStreamers = 1;
   }
 
   /**
@@ -447,23 +462,66 @@ public class HoodieMultiTableStreamer {
     return targetBasePath;
   }
 
+  protected void sleepBeforeNextRound(long startEpochMillis) {
+    try {
+      long sleepMs = config.minSyncIntervalSeconds * 1000 - (System.currentTimeMillis() - startEpochMillis);
+      if (sleepMs > 0) {
+        logger.info(String.format("Last round took less than min sync interval: %d s; sleep for %.2f s",
+                config.minSyncIntervalSeconds, sleepMs / 1000.0));
+        Thread.sleep(sleepMs);
+      }
+    } catch (InterruptedException e) {
+      throw new HoodieIngestionException("MultiStreamer service (continuous mode) was interrupted during sleep.", e);
+    }
+  }
+
   /**
    * Creates actual HoodieDeltaStreamer objects for every table/topic and does incremental sync.
    */
-  public void sync() {
-    for (TableExecutionContext context : tableExecutionContexts) {
-      try {
-        new HoodieStreamer(context.getConfig(), jssc, Option.ofNullable(context.getProperties())).sync();
-        successTables.add(Helpers.getTableWithDatabase(context));
-      } catch (Exception e) {
-        logger.error("error while running MultiTableDeltaStreamer for table: " + context.getTableName(), e);
-        failedTables.add(Helpers.getTableWithDatabase(context));
+  public void sync() throws InterruptedException {
+    if (config.continuousMode) {
+      while (true) {
+        long startEpochMillis = System.currentTimeMillis();
+        logger.info("Starting one run of multi streamer");
+        runOneRound();
+        logger.info("Finished one run of multi streamer");
+        sleepBeforeNextRound(startEpochMillis);
       }
+    } else {
+      runOneRound();
     }
+  }
 
+  private void runOneRound() throws InterruptedException {
+    int numThreads = Math.min(tableExecutionContexts.size(), config.numConcurrentStreamers);
+    ThreadPoolExecutor executor =
+            (ThreadPoolExecutor) Executors.newFixedThreadPool(numThreads);
+    successTables.clear();
+    failedTables.clear();
+    final CountDownLatch latch = new CountDownLatch(tableExecutionContexts.size());
+    for (TableExecutionContext context : tableExecutionContexts) {
+      executor.submit(() -> {
+        try {
+          logger.info("Starting one run of HoodieStreamer for table: " + context.getTableName());
+          new HoodieStreamer(context.getConfig(), jssc, Option.ofNullable(context.getProperties())).sync();
+          successTables.add(Helpers.getTableWithDatabase(context));
+          logger.info("Finished one run of HoodieStreamer successfully for table: " + context.getTableName());
+        } catch (Exception e) {
+          logger.error("error while running MultiTableDeltaStreamer for table: " + context.getTableName(), e);
+          failedTables.add(Helpers.getTableWithDatabase(context));
+        } finally {
+          latch.countDown();
+        }
+        return context.getTableName();
+      });
+    }
+    logger.info("Awaiting streamer runs for all tables to finish !!");
+    latch.await();
+    logger.info("Done waiting for streamer runs for all tables to finish !!");
     logger.info("Ingestion was successful for topics: " + successTables);
     if (!failedTables.isEmpty()) {
-      logger.info("Ingestion failed for topics: " + failedTables);
+      logger.error("Ingestion failed for topics: " + failedTables);
+      throw new HoodieException("Ingestion failed for topics: " + failedTables);
     }
   }
 

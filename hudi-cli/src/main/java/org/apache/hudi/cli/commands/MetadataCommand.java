@@ -24,19 +24,24 @@ import org.apache.hudi.cli.TableHeader;
 import org.apache.hudi.cli.utils.SparkUtil;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.common.config.HoodieMetadataConfig;
+import org.apache.hudi.common.config.SerializableConfiguration;
 import org.apache.hudi.common.engine.HoodieLocalEngineContext;
+import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.util.HoodieTimer;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.StringUtils;
 import org.apache.hudi.common.util.ValidationUtils;
 import org.apache.hudi.config.HoodieWriteConfig;
+
+import org.apache.hudi.metadata.FileSystemBackedTableMetadata;
 import org.apache.hudi.metadata.HoodieBackedTableMetadata;
 import org.apache.hudi.metadata.HoodieTableMetadata;
 import org.apache.hudi.metadata.HoodieTableMetadataUtil;
 import org.apache.hudi.metadata.HoodieTableMetadataWriter;
 import org.apache.hudi.metadata.MetadataPartitionType;
 import org.apache.hudi.metadata.SparkHoodieBackedTableMetadataWriter;
+
 import org.apache.spark.api.java.JavaSparkContext;
 
 import org.apache.hadoop.fs.FileStatus;
@@ -224,7 +229,7 @@ public class MetadataCommand {
 
       HoodieTimer timer = HoodieTimer.start();
       List<String> partitions = metadata.getAllPartitionPaths();
-      LOG.debug("Took " + timer.endTimer() + " ms");
+      LOG.debug("Metadata Partition listing took " + timer.endTimer() + " ms");
 
       final List<Comparable[]> rows = new ArrayList<>();
       partitions.stream().sorted(Comparator.reverseOrder()).forEach(p -> {
@@ -252,12 +257,12 @@ public class MetadataCommand {
 
       Path partitionPath = new Path(HoodieCLI.basePath);
       if (!StringUtils.isNullOrEmpty(partition)) {
-        partitionPath = new Path(HoodieCLI.basePath, partition);
+        partitionPath = FSUtils.getPartitionPath(HoodieCLI.basePath, partition);
       }
 
       HoodieTimer timer = HoodieTimer.start();
       FileStatus[] statuses = metaReader.getAllFilesInPartition(partitionPath);
-      LOG.debug("Took " + timer.endTimer() + " ms");
+      LOG.debug("Metadata Listing took " + timer.endTimer() + " ms");
 
       final List<Comparable[]> rows = new ArrayList<>();
       Arrays.stream(statuses).sorted((p1, p2) -> p2.getPath().getName().compareTo(p1.getPath().getName())).forEach(f -> {
@@ -273,7 +278,9 @@ public class MetadataCommand {
 
   @ShellMethod(key = "metadata validate-files", value = "Validate all files in all partitions from the metadata")
   public String validateFiles(
-      @ShellOption(value = {"--verbose"}, help = "Print all file details", defaultValue = "false") final boolean verbose) throws IOException {
+          @ShellOption(value = {"--assume-date-partition"}, help = "Print all file details", defaultValue = "false") final boolean assumeDatePartitioning,
+          @ShellOption(value = {"--verbose"}, help = "Print all file details", defaultValue = "false") final boolean verbose)
+        throws IOException {
     HoodieCLI.getTableMetaClient();
     HoodieMetadataConfig config = HoodieMetadataConfig.newBuilder().enable(true).build();
     HoodieBackedTableMetadata metadataReader = new HoodieBackedTableMetadata(
@@ -283,13 +290,14 @@ public class MetadataCommand {
       return "[ERROR] Metadata Table not enabled/initialized\n\n";
     }
 
+    FileSystemBackedTableMetadata fsMetaReader = new FileSystemBackedTableMetadata(new HoodieLocalEngineContext(HoodieCLI.conf),
+            HoodieCLI.getTableMetaClient().getTableConfig(), new SerializableConfiguration(HoodieCLI.conf),
+            HoodieCLI.basePath, assumeDatePartitioning);
     HoodieMetadataConfig fsConfig = HoodieMetadataConfig.newBuilder().enable(false).build();
-    HoodieBackedTableMetadata fsMetaReader = new HoodieBackedTableMetadata(
-        new HoodieLocalEngineContext(HoodieCLI.conf), fsConfig, HoodieCLI.basePath);
 
     HoodieTimer timer = HoodieTimer.start();
     List<String> metadataPartitions = metadataReader.getAllPartitionPaths();
-    LOG.debug("Listing partitions Took " + timer.endTimer() + " ms");
+    LOG.debug("Metadata Listing partitions Took " + timer.endTimer() + " ms");
     List<String> fsPartitions = fsMetaReader.getAllPartitionPaths();
     Collections.sort(fsPartitions);
     Collections.sort(metadataPartitions);
@@ -298,6 +306,7 @@ public class MetadataCommand {
     allPartitions.addAll(fsPartitions);
     allPartitions.addAll(metadataPartitions);
 
+    LOG.info("FS Partitions : " + fsPartitions + ", Metadata based partitions : " + metadataPartitions);
     if (!fsPartitions.equals(metadataPartitions)) {
       LOG.error("FS partition listing is not matching with metadata partition listing!");
       LOG.error("All FS partitions: " + Arrays.toString(fsPartitions.toArray()));
@@ -308,9 +317,9 @@ public class MetadataCommand {
     for (String partition : allPartitions) {
       Map<String, FileStatus> fileStatusMap = new HashMap<>();
       Map<String, FileStatus> metadataFileStatusMap = new HashMap<>();
-      FileStatus[] metadataStatuses = metadataReader.getAllFilesInPartition(new Path(HoodieCLI.basePath, partition));
+      FileStatus[] metadataStatuses = metadataReader.getAllFilesInPartition(FSUtils.getPartitionPath(HoodieCLI.basePath, partition));
       Arrays.stream(metadataStatuses).forEach(entry -> metadataFileStatusMap.put(entry.getPath().getName(), entry));
-      FileStatus[] fsStatuses = fsMetaReader.getAllFilesInPartition(new Path(HoodieCLI.basePath, partition));
+      FileStatus[] fsStatuses = fsMetaReader.getAllFilesInPartition(FSUtils.getPartitionPath(HoodieCLI.basePath, partition));
       Arrays.stream(fsStatuses).forEach(entry -> fileStatusMap.put(entry.getPath().getName(), entry));
 
       Set<String> allFiles = new HashSet<>();
